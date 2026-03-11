@@ -45,19 +45,28 @@ async function startServer() {
   // Перехватываем попытку апгрейда до WebSocket
   server.on('upgrade', (request, socket, head) => {
     try {
-      const url = new URL(request.url || '', `http://${request.headers.host}`);
-      const token = url.searchParams.get('token');
-
-      // Проверяем секретный путь и токен
-      if (url.pathname.startsWith('/secure-relay') && token === SECRET_TOKEN) {
-        wss.handleUpgrade(request, socket, head, (ws) => {
-          wss.emit('connection', ws, request);
-        });
+      console.log(`[WebSocket] Incoming upgrade request: ${request.url}`);
+      const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
+      
+      // Проверяем секретный путь
+      if (url.pathname.startsWith('/secure-relay')) {
+        const token = url.searchParams.get('token');
+        
+        if (token === SECRET_TOKEN) {
+          wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit('connection', ws, request);
+          });
+        } else {
+          console.log(`[WebSocket] Rejected connection: Invalid token. Expected: ${SECRET_TOKEN}, Got: ${token}`);
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+        }
       } else {
-        // Если это сканер или неверный токен - обрываем соединение
-        socket.destroy();
+        // Если путь другой (например, Vite HMR), просто игнорируем,
+        // чтобы другие обработчики могли его подхватить.
       }
     } catch (e) {
+      console.error('[WebSocket] Upgrade error:', e);
       socket.destroy();
     }
   });

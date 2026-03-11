@@ -92,7 +92,7 @@ export default function SecureVideoCall() {
           }
         };
 
-        socket.onmessage = (event) => {
+        socket.onmessage = async (event) => {
           if (typeof event.data === 'string') {
             try {
               const msg = JSON.parse(event.data);
@@ -102,12 +102,17 @@ export default function SecureVideoCall() {
                     setErrorMsg(`Remote MimeType ${msg.mimeType} is not supported here.`);
                     return;
                   }
-                  const sb = mediaSource.addSourceBuffer(msg.mimeType);
-                  sourceBufferRef.current = sb;
-                  sb.addEventListener('updateend', () => {
-                    isAppending = false;
-                    processQueue();
-                  });
+                  try {
+                    const sb = mediaSource.addSourceBuffer(msg.mimeType);
+                    sourceBufferRef.current = sb;
+                    sb.addEventListener('updateend', () => {
+                      isAppending = false;
+                      processQueue();
+                    });
+                  } catch (e: any) {
+                    console.error("Failed to add source buffer", e);
+                    setErrorMsg(`Failed to add source buffer: ${e.message}`);
+                  }
                 }
               }
             } catch (e) {
@@ -119,7 +124,19 @@ export default function SecureVideoCall() {
           if (!sourceBufferRef.current) return; // Wait for mimeType
 
           // 3. СНИМАЕМ ОБФУСКАЦИЮ (Удаляем мусорный паддинг)
-          const unpaddedData = removePadding(event.data);
+          let unpaddedData: ArrayBuffer;
+          try {
+            // Если данные пришли как Blob (часто бывает в браузерах)
+            if (event.data instanceof Blob) {
+              const buffer = await event.data.arrayBuffer();
+              unpaddedData = removePadding(buffer);
+            } else {
+              unpaddedData = removePadding(event.data);
+            }
+          } catch (e) {
+             console.error("Error removing padding", e);
+             return;
+          }
           
           queue.push(unpaddedData);
           processQueue();
@@ -175,17 +192,21 @@ export default function SecureVideoCall() {
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = async (event) => {
-        if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-          const buffer = await event.data.arrayBuffer();
-          
-          // 4. ДОБАВЛЯЕМ ОБФУСКАЦИЮ (Мусорные байты для обмана DPI)
-          const paddedData = addPadding(buffer);
-          wsRef.current.send(paddedData);
+        if (event.data && event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+          try {
+            const buffer = await event.data.arrayBuffer();
+            // 4. ДОБАВЛЯЕМ ОБФУСКАЦИЮ (Мусорные байты для обмана DPI)
+            const paddedData = addPadding(buffer);
+            wsRef.current.send(paddedData);
+          } catch (e) {
+            console.error("Error processing video chunk", e);
+          }
         }
       };
 
-      // Отправляем чанки каждые 200мс (баланс между задержкой и нагрузкой)
-      recorder.start(200);
+      // Отправляем чанки каждые 1000мс (1 секунда).
+      // На мобильных устройствах слишком частые чанки (200мс) ломают MediaSource
+      recorder.start(1000);
       setIsStreaming(true);
       setStatusMsg('Streaming active');
       setErrorMsg('');

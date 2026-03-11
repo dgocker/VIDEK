@@ -14,11 +14,16 @@ export default function SecureVideoCall() {
   const [roomId, setRoomId] = useState('test-room-1');
   const [isConnected, setIsConnected] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [statusMsg, setStatusMsg] = useState('Disconnected');
+  const [errorMsg, setErrorMsg] = useState('');
+
+  const mimeIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     return () => {
       if (wsRef.current) wsRef.current.close();
       if (mediaRecorderRef.current) mediaRecorderRef.current.stop();
+      if (mimeIntervalRef.current) clearInterval(mimeIntervalRef.current);
     };
   }, []);
 
@@ -37,6 +42,8 @@ export default function SecureVideoCall() {
     socket.onopen = () => {
       console.log('Connected to Secure Relay');
       setIsConnected(true);
+      setStatusMsg('Connected to Relay');
+      setErrorMsg('');
       setupMediaSource(socket);
     };
 
@@ -44,14 +51,20 @@ export default function SecureVideoCall() {
       console.log('Disconnected from Secure Relay');
       setIsConnected(false);
       setIsStreaming(false);
+      setStatusMsg('Disconnected');
     };
     
     socket.onerror = (error) => {
         console.error("WebSocket Error:", error);
+        setErrorMsg('WebSocket connection failed. Check console.');
     }
   };
 
   const setupMediaSource = (socket: WebSocket) => {
+    if (!window.MediaSource) {
+      setErrorMsg('MediaSource API is not supported in this browser (e.g. older iOS).');
+      return;
+    }
     const mediaSource = new MediaSource();
     if (remoteVideoRef.current) {
       remoteVideoRef.current.src = URL.createObjectURL(mediaSource);
@@ -59,16 +72,13 @@ export default function SecureVideoCall() {
 
     mediaSource.addEventListener('sourceopen', () => {
       try {
-        // Используем кодек VP8 (он хорошо поддерживается)
-        const sourceBuffer = mediaSource.addSourceBuffer('video/webm; codecs="vp8, opus"');
-        sourceBufferRef.current = sourceBuffer;
-
         // Очередь для пакетов, если буфер занят
         const queue: ArrayBuffer[] = [];
         let isAppending = false;
 
         const processQueue = () => {
-          if (queue.length > 0 && !isAppending && !sourceBuffer.updating) {
+          const sourceBuffer = sourceBufferRef.current;
+          if (sourceBuffer && queue.length > 0 && !isAppending && !sourceBuffer.updating) {
             isAppending = true;
             const data = queue.shift();
             if (data) {
@@ -82,33 +92,86 @@ export default function SecureVideoCall() {
           }
         };
 
-        sourceBuffer.addEventListener('updateend', () => {
-          isAppending = false;
-          processQueue();
-        });
-
         socket.onmessage = (event) => {
+          if (typeof event.data === 'string') {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'mime' && msg.mimeType) {
+                if (!sourceBufferRef.current) {
+                  if (!MediaSource.isTypeSupported(msg.mimeType)) {
+                    setErrorMsg(`Remote MimeType ${msg.mimeType} is not supported here.`);
+                    return;
+                  }
+                  const sb = mediaSource.addSourceBuffer(msg.mimeType);
+                  sourceBufferRef.current = sb;
+                  sb.addEventListener('updateend', () => {
+                    isAppending = false;
+                    processQueue();
+                  });
+                }
+              }
+            } catch (e) {
+              console.error("Error parsing string message", e);
+            }
+            return;
+          }
+
+          if (!sourceBufferRef.current) return; // Wait for mimeType
+
           // 3. СНИМАЕМ ОБФУСКАЦИЮ (Удаляем мусорный паддинг)
           const unpaddedData = removePadding(event.data);
           
           queue.push(unpaddedData);
           processQueue();
         };
-      } catch (e) {
+      } catch (e: any) {
         console.error("Error setting up MediaSource", e);
+        setErrorMsg('MediaSource error: ' + e.message);
       }
     });
   };
 
   const startStreaming = async () => {
     try {
+      setStatusMsg('Requesting camera...');
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
 
+      const possibleTypes = [
+        'video/webm; codecs="vp8, opus"',
+        'video/webm; codecs="vp9, opus"',
+        'video/webm',
+        'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+        'video/mp4'
+      ];
+      
+      let mimeType = '';
+      for (const type of possibleTypes) {
+        if (MediaRecorder.isTypeSupported(type)) {
+          mimeType = type;
+          break;
+        }
+      }
+
+      if (!mimeType) {
+        setErrorMsg(`MediaRecorder does not support any known video types on this browser.`);
+        return;
+      }
+
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'mime', mimeType }));
+      }
+      
+      mimeIntervalRef.current = setInterval(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'mime', mimeType }));
+        }
+      }, 2000);
+
       // Нарезаем поток на чанки
-      const recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs="vp8, opus"' });
+      const recorder = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = async (event) => {
@@ -124,15 +187,21 @@ export default function SecureVideoCall() {
       // Отправляем чанки каждые 200мс (баланс между задержкой и нагрузкой)
       recorder.start(200);
       setIsStreaming(true);
-    } catch (err) {
+      setStatusMsg('Streaming active');
+      setErrorMsg('');
+    } catch (err: any) {
       console.error('Error accessing media devices:', err);
-      alert('Could not access camera/microphone. Please check permissions.');
+      setErrorMsg('Camera error: ' + err.message);
     }
   };
 
   const stopStreaming = () => {
       if (mediaRecorderRef.current) {
           mediaRecorderRef.current.stop();
+      }
+      if (mimeIntervalRef.current) {
+          clearInterval(mimeIntervalRef.current);
+          mimeIntervalRef.current = null;
       }
       if (localVideoRef.current && localVideoRef.current.srcObject) {
           const stream = localVideoRef.current.srcObject as MediaStream;
@@ -221,6 +290,17 @@ export default function SecureVideoCall() {
                 </button>
             </div>
         )}
+
+        <div className="mt-4 text-sm">
+          <p className="text-gray-600">
+            Status: <span className="font-semibold text-gray-900">{statusMsg}</span>
+          </p>
+          {errorMsg && (
+            <p className="text-red-500 font-bold mt-1">
+              Error: {errorMsg}
+            </p>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
